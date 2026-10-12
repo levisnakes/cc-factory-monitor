@@ -71,6 +71,43 @@ local function pushFeed(text, sev)
   while #feed > 6 do table.remove(feed) end
 end
 
+local function crafterFresh()
+  return crafter.msg and now() - crafter.at < 10
+end
+
+-- Ingredients the crafter is stuck waiting for: { recipe, item, have, need }.
+local function crafterBlocked()
+  local out = {}
+  if not crafterFresh() then return out end
+  for _, r in ipairs(crafter.msg.recipes or {}) do
+    for _, m in ipairs(r.missing or {}) do
+      table.insert(out, { recipe = r.name, item = m.item, have = m.have, need = m.need })
+    end
+  end
+  return out
+end
+
+local function neededSet()
+  local set = {}
+  for _, b in ipairs(crafterBlocked()) do set[b.item] = true end
+  return set
+end
+
+-- Trace why the network is short of an item, from the gauge that makes it.
+-- Returns text and a severity for coloring.
+local function supplyState(item)
+  local best
+  for _, g in ipairs(data.gauges) do
+    if g.item == item and (not best or g.sev < best.sev) then best = g end
+  end
+  if not best then return "no gauge makes it", 1 end
+  if best.paused or data.paused then return "its gauge is paused", 1 end
+  if best.promised > 0 then return "+" .. fmtNum(best.promised) .. " on the way", 3 end
+  if best.waiting then return "its gauge is waiting for inputs", 1 end
+  if best.satisfied then return "gauge target is too low", 2 end
+  return "gauge is short, ordering soon", 2
+end
+
 local function readController()
   local name = controllerName()
   if not name or not peripheral.isPresent(name) then
@@ -111,7 +148,10 @@ local function readController()
       lastState[key] = e.sev
     end
   end
+  local needed = neededSet()
   table.sort(list, function(a, b)
+    local na, nb = needed[a.item] and 0 or 1, needed[b.item] and 0 or 1
+    if na ~= nb then return na < nb end
     if a.sev ~= b.sev then return a.sev < b.sev end
     local da, db = a.targetItems - a.stock, b.targetItems - b.stock
     if da ~= db then return da > db end
@@ -143,10 +183,6 @@ local function stats()
     s.promised = s.promised + g.promised
   end
   return s
-end
-
-local function crafterFresh()
-  return crafter.msg and now() - crafter.at < 10
 end
 
 local function crafterRecipeFor(item)
@@ -356,9 +392,18 @@ local function drawGauge(g, x, y, w, h, small, medium)
   local right = x + w - pad
   local name = pretty(g.item)
   local cc = crafterRecipeFor(g.item)
-  local tag = cc and "  CC" or ""
+  local needed = neededSet()[g.item]
+  local tag = (needed and "  NEEDED") or (cc and "  CC") or ""
   text(fit(name, right - tx - textWidth(tag, small, "bold"), medium, "bold"), tx, y + pad - 2, WHITE, medium, "bold")
-  if cc then textRight("CC", right, y + pad, BLUE, small, "bold") end
+  if needed then
+    textRight("NEEDED", right, y + pad, RED, small, "bold")
+    -- red outline so it stands out
+    rect(x, y, w, 2, RED)
+    rect(x, y + h - 2, w, 2, RED)
+    rect(x + w - 2, y, 2, h, RED)
+  elseif cc then
+    textRight("CC", right, y + pad, BLUE, small, "bold")
+  end
 
   local unit = g.fluid and (g.unit == "FLUID_BUCKET" and " B" or " mB") or ""
   local counts = fmtNum(g.stock) .. "/" .. fmtNum(g.targetItems) .. unit
@@ -447,7 +492,12 @@ local function drawGpu()
       local made = 0
       for _, r in ipairs(m.recipes or {}) do made = made + (r.made or 0) end
       local busy = m.active ~= nil
-      tile(x, y, tileW, tileH, "Crafter: " .. (busy and "crafting" or "idle"), busy and pretty(m.active) or (fmtNum(made) .. " made"), busy and AMBER or GREEN, small, big)
+      local blocked = crafterBlocked()
+      if #blocked > 0 and not busy then
+        tile(x, y, tileW, tileH, "Crafter: blocked", pretty(blocked[1].item), RED, small, big)
+      else
+        tile(x, y, tileW, tileH, "Crafter: " .. (busy and "crafting" or "idle"), busy and pretty(m.active) or (fmtNum(made) .. " made"), busy and AMBER or GREEN, small, big)
+      end
     else
       tile(x, y, tileW, tileH, "Crafter", "offline", GREY, small, big)
     end
@@ -480,8 +530,15 @@ local function drawGpu()
   -- Footer: latest event and page dots
   local fy = H - footH
   rect(0, fy, W, footH, PANEL)
+  local blocked = crafterBlocked()
   local ev = feed[1]
-  if ev then
+  if #blocked > 0 then
+    local b = blocked[math.floor(now() / 4) % #blocked + 1]
+    local why, sev = supplyState(b.item)
+    local msg = b.recipe .. " blocked: " .. pretty(b.item) .. " " .. b.have .. "/" .. b.need .. "  >  " .. why
+    circle(pad + 4, fy + footH / 2, 4, RED, true)
+    text(fit(msg, W - pad * 2 - 14 - pageCount * 12, small, "bold"), pad + 14, fy + (footH - small) / 2 - 1, SEV_COLOR[sev] or RED, small, "bold")
+  elseif ev then
     local c = SEV_COLOR[ev.sev] or WHITE
     circle(pad + 4, fy + footH / 2, 4, c, true)
     text(fit(ev.t .. "  " .. ev.text, W * 0.6, small), pad + 14, fy + (footH - small) / 2 - 1, WHITE, small)
@@ -522,6 +579,11 @@ local function drawPlain()
     return
   end
   at(1, 2, "Healthy " .. s.ok .. "/" .. s.total .. "  Short " .. s.short .. "  Transit " .. fmtNum(s.promised) .. "  Links " .. data.missing, colours.lightGrey)
+  local blocked = crafterBlocked()
+  if #blocked > 0 then
+    local b = blocked[1]
+    at(1, 3, (b.recipe .. " blocked: " .. pretty(b.item) .. " > " .. supplyState(b.item)):sub(1, w), colours.red)
+  end
   local sevC = { colours.red, colours.orange, colours.lightBlue, colours.grey, colours.lime }
   local per = h - 4
   pageCount = math.max(1, math.ceil(#data.gauges / per))
@@ -567,6 +629,11 @@ local function drawTerminal()
     term.setTextColor(colors.white)
   end
   print("Crafter: " .. (crafterFresh() and (crafter.msg.activity or "online") or "offline"))
+  for _, b in ipairs(crafterBlocked()) do
+    term.setTextColor(colors.red)
+    print("  " .. b.recipe .. " needs " .. pretty(b.item) .. " (" .. b.have .. "/" .. b.need .. "): " .. supplyState(b.item))
+    term.setTextColor(colors.white)
+  end
   print("Display: " .. (useGpu and "DirectGPU" or "plain monitor"))
   if gpuError then
     term.setTextColor(colors.orange)
