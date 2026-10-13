@@ -26,3 +26,14 @@ Set `DISCORD_WEBHOOK` (and `DISCORD_MENTION`, e.g. `"<@&ROLE_ID>"`) at the top o
 
 - the crafting computer stopped reporting for 2+ minutes (restart the crafting computer)
 - the Factory Controller can't be read for 2+ minutes (check its modem, restart this computer)
+
+## config.lua
+
+Anything in `/config.lua` on the computer overrides the settings at the top of the program, and survives reinstalls and updates. One file can be shared by every computer; each program ignores settings it doesn't use. Example:
+
+```lua
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/..."
+DISCORD_MENTION = "<@&ROLE_ID>"
+ALLOWED = { "YourName", "Friend" }
+INPUT_CHEST = "minecraft:chest_3"
+```
