@@ -8,6 +8,8 @@ CONTROLLER = nil      -- nil = find the Factory Controller
 TITLE = "FACTORY"
 PAGE_SECONDS = 8      -- how long each page of gauges stays up
 RESOLUTION = nil      -- DirectGPU sharpness 1-4; nil = pick one to fit the monitor
+DISCORD_WEBHOOK = nil -- Discord webhook URL (in quotes) for "stuck" alerts
+DISCORD_MENTION = nil -- who to ping when something is stuck, e.g. "<@&ROLE_ID>"
 AUTO_UPDATE = true        -- install new versions from GitHub automatically, keeping these settings
 
 
@@ -612,6 +614,67 @@ end
 local useGpu = false
 local gpuError = nil
 
+-- ============================================================ stuck alerts
+
+-- Pings Discord when the crafting computer goes silent or the controller is
+-- gone, saying what to restart; a follow-up without a ping when it's fixed.
+local alerts = { queue = {}, open = {}, error = nil }
+
+local function alertEmbed(title, what, fix, color, ping)
+  if not DISCORD_WEBHOOK or DISCORD_WEBHOOK == "" or not http then return end
+  local fields = { { name = "What happened", value = what } }
+  if fix then table.insert(fields, { name = "What to do", value = fix }) end
+  local ok, body = pcall(textutils.serializeJSON, {
+    username = "Factory Monitor",
+    content = (ping and DISCORD_MENTION) or "",
+    allowed_mentions = { parse = { "roles", "users", "everyone" } },
+    embeds = { { title = title, color = color, fields = fields, footer = { text = os.date("!%Y-%m-%d %H:%M UTC") } } },
+  }, { unicode_strings = true })
+  if ok then table.insert(alerts.queue, body) end
+end
+
+local function problemCheck(key, active, delay, title, what, fix)
+  local p = alerts.open[key]
+  if active then
+    if not p then
+      p = { since = now(), sent = false }
+      alerts.open[key] = p
+    end
+    if not p.sent and now() - p.since >= delay then
+      p.sent, p.title = true, title
+      alertEmbed("STUCK: " .. title, what, fix, 15158332, true)
+    end
+  elseif p then
+    if p.sent then alertEmbed("Fixed: " .. p.title, "Back to normal.", nil, 3066993, false) end
+    alerts.open[key] = nil
+  end
+end
+
+local function alertLoop()
+  local lastTick = 0
+  while true do
+    if now() - lastTick >= 10 then
+      lastTick = now()
+      -- only once we've heard from the crafter at least once, so a monitor
+      -- without a crafter never alerts
+      problemCheck("crafter", crafter.at > 0 and not crafterFresh(), 120, "crafting computer offline",
+        "The Mech Crafter computer hasn't reported in for over 2 minutes.",
+        "Restart the **crafting computer** (and make sure the base it's in is loaded). Check the cable or modems between it and this Factory Monitor.")
+      problemCheck("controller", not data.ok, 120, "Factory Controller unreadable",
+        data.err or "The Factory Monitor can't read the Factory Controller.",
+        "Check the wired modem on the **Factory Controller** is red (connected), then restart the **Factory Monitor computer**.")
+    end
+    local body = table.remove(alerts.queue, 1)
+    if body then
+      local ok, res, err = pcall(http.post, DISCORD_WEBHOOK, body, { ["Content-Type"] = "application/json" })
+      if ok and res then res.close() alerts.error = nil else alerts.error = tostring(err or res) end
+      sleep(2)
+    else
+      sleep(1)
+    end
+  end
+end
+
 local function drawTerminal()
   term.setBackgroundColor(colors.black)
   term.clear()
@@ -852,4 +915,4 @@ local function bootUpdate()
 end
 
 bootUpdate()
-parallel.waitForAny(dataLoop, netLoop, displayLoop, inputLoop, updateLoop)
+parallel.waitForAny(dataLoop, netLoop, displayLoop, inputLoop, alertLoop, updateLoop)

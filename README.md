@@ -19,3 +19,10 @@ wget https://raw.githubusercontent.com/levisnakes/cc-factory-monitor/main/factor
 Settings at the top of the file: `MONITOR`, `CONTROLLER` (both found automatically when left `nil`), `TITLE`, `PAGE_SECONDS`, `RESOLUTION`.
 
 Tap the left or right half of the monitor to flip pages when there are more gauges than fit.
+
+## Stuck alerts
+
+Set `DISCORD_WEBHOOK` (and `DISCORD_MENTION`, e.g. `"<@&ROLE_ID>"`) at the top of the file to get a Discord ping only when something is really stuck, with what to restart or fix. Each problem is posted once, and a follow-up without a ping says when it's fixed.
+
+- the crafting computer stopped reporting for 2+ minutes (restart the crafting computer)
+- the Factory Controller can't be read for 2+ minutes (check its modem, restart this computer)
