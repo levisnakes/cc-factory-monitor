@@ -37,3 +37,7 @@ DISCORD_MENTION = "<@&ROLE_ID>"
 ALLOWED = { "YourName", "Friend" }
 INPUT_CHEST = "minecraft:chest_3"
 ```
+
+## Crafty turtles (built in)
+
+With a **Stock Ticker** on this computer's network, the monitor also runs crafty turtles from [cc-craft-dispatch](https://github.com/levisnakes/cc-craft-dispatch) (`crafter.lua` on each turtle). For every **Passive** gauge that is short and has a learned recipe it orders the ingredients for up to `BATCH` crafts through the Stock Ticker to a free turtle's own address and tells the turtle the recipe. Teach a recipe by putting it in a turtle's 3x3 grid and pressing L. Turtle orders show as "on the way" on the dashboard and in its activity feed; the terminal lists the turtles, open orders and anything short. `DISPATCH = false` turns it off.

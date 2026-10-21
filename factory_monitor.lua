@@ -2,6 +2,9 @@
 -- Reads every gauge on the controller, draws a statistics dashboard on a
 -- monitor (full color with a DirectGPU block, plain text without), and shares
 -- the gauge data over rednet so the Mech Crafter computer knows what to make.
+-- With a Stock Ticker on the network it also runs the crafty turtles (crafter.lua from
+-- cc-craft-dispatch): for every Passive gauge that is short and has a learned recipe it orders the
+-- ingredients for up to BATCH crafts to a free turtle's own address and tells it the recipe.
 
 MONITOR = nil         -- nil = the biggest monitor attached
 CONTROLLER = nil      -- nil = find the Factory Controller
@@ -10,6 +13,9 @@ PAGE_SECONDS = 8      -- how long each page of gauges stays up
 RESOLUTION = nil      -- DirectGPU sharpness 1-4; nil = pick one to fit the monitor
 DISCORD_WEBHOOK = nil -- Discord webhook URL (in quotes) for "stuck" alerts
 DISCORD_MENTION = nil -- who to ping when something is stuck, e.g. "<@&ROLE_ID>"
+DISPATCH = true       -- run the crafty turtles when a Stock Ticker is on the network
+BATCH = 64            -- most crafts ordered for one turtle at a time
+ORDER_TIMEOUT_MINUTES = 10  -- forget a turtle order that never finished after this long
 AUTO_UPDATE = true        -- install new versions from GitHub automatically, keeping these settings
 
 -- Settings in /config.lua override the ones above. Use it for anything you
@@ -33,6 +39,9 @@ end
 -- ============================================================ basics
 
 local function now() return os.epoch("utc") / 1000 end
+
+-- turtle crafting (filled in by the dispatcher block further down)
+local dispatch = { active = false, flying = {}, stations = {}, recipes = {}, jobs = {}, lines = {} }
 
 local function pretty(id)
   if not id or id == "" then return "Empty" end
@@ -151,7 +160,9 @@ local function readController()
         stock = g.stock or 0, promised = g.promised or 0,
         satisfied = g.satisfied == true, waiting = g.waitingForNetwork == true,
         paused = g.redstonePowered == true, address = g.address or "",
+        passive = g.requestMode ~= "NORMAL",
       }
+      e.promised = e.promised + (dispatch.flying[g.item] or 0)
       e.targetItems = e.target * unitMult(e)
       e.fluid = g.unit == "FLUID_MB" or g.unit == "FLUID_BUCKET"
       e.sev, e.label, e.shortLabel = classify(e)
@@ -252,6 +263,194 @@ local function netLoop()
       crafter.at = now()
     elseif ev[1] == "peripheral" or ev[1] == "peripheral_detach" then
       openModems()
+    end
+  end
+end
+
+-- ============================================================ turtle crafting (dispatcher)
+
+local dispatchLoop
+do
+  local PROTOCOL = "craft-dispatch"
+  local DIR = "/dispatch"
+  if not fs.exists(DIR) then fs.makeDir(DIR) end
+
+  local function load(path, default)
+    if not fs.exists(path) then return default end
+    local f = fs.open(path, "r")
+    local v = textutils.unserialize(f.readAll())
+    f.close()
+    return v == nil and default or v
+  end
+  local function save(path, v)
+    local f = fs.open(path .. ".tmp", "w")
+    f.write(textutils.serialize(v))
+    f.close()
+    if fs.exists(path) then fs.delete(path) end
+    fs.move(path .. ".tmp", path)
+  end
+
+  dispatch.recipes = load(DIR .. "/recipes", {})  -- [output] = { grid = {9}, outCount }
+  dispatch.jobs = load(DIR .. "/jobs", {})         -- [id] = { id, station, out, crafts, outCount, t }
+  local nextJob = load(DIR .. "/next", 1)
+  local recent = {}                                -- finished results not yet in the gauge's stock
+  local lastStock = {}
+  local ticker
+
+  local function saveJobs() save(DIR .. "/jobs", dispatch.jobs) save(DIR .. "/next", nextJob) end
+  local function note(text, sev)
+    table.insert(dispatch.lines, 1, os.date("!%H:%M ") .. text)
+    while #dispatch.lines > 30 do table.remove(dispatch.lines) end
+    pushFeed(text, sev or 3)
+  end
+  local function send(msg) pcall(rednet.broadcast, msg, PROTOCOL) end
+  local function perCraft(grid)
+    local need = {}
+    for i = 1, 9 do if grid[i] then need[grid[i]] = (need[grid[i]] or 0) + 1 end end
+    return need
+  end
+
+  local function inFlight(out)
+    local n = 0
+    for _, j in pairs(dispatch.jobs) do if j.out == out then n = n + j.crafts * (j.outCount or 1) end end
+    for _, r in ipairs(recent) do
+      if r.out == out then n = n + math.max(0, r.count - math.max(0, (lastStock[out] or 0) - r.stockAt)) end
+    end
+    return n
+  end
+
+  local function freeStation()
+    local best
+    for id, st in pairs(dispatch.stations) do
+      if st.free and not st.assigned and now() - st.t < 8 and (not best or id < best) then best = id end
+    end
+    return best
+  end
+
+  local function order(out, crafts, station, stock)
+    local r, st = dispatch.recipes[out], dispatch.stations[station]
+    local filters = {}
+    for name, per in pairs(perCraft(r.grid)) do
+      table.insert(filters, { name = name, _requestCount = per * crafts })
+    end
+    local ok, sent = pcall(ticker.requestFiltered, st.address, table.unpack(filters))
+    if not ok or not sent or sent == 0 then
+      note("Couldn't order " .. pretty(out) .. " ingredients: " .. tostring(sent), 1)
+      return false
+    end
+    for name, per in pairs(perCraft(r.grid)) do stock[name] = (stock[name] or 0) - per * crafts end
+    local id = nextJob
+    nextJob = nextJob + 1
+    dispatch.jobs[id] = { id = id, station = station, out = out, crafts = crafts, outCount = r.outCount or 1, t = now() }
+    saveJobs()
+    st.assigned, st.assignedAt = id, now()
+    send({ kind = "job", to = station, job = id, grid = r.grid, crafts = crafts, out = out, outCount = r.outCount or 1 })
+    note("Ordered " .. crafts * (r.outCount or 1) .. "x " .. pretty(out) .. " -> " .. st.name, 3)
+    return true
+  end
+
+  local function tick()
+    for id, j in pairs(dispatch.jobs) do
+      if now() - j.t > ORDER_TIMEOUT_MINUTES * 60 then
+        note("Turtle order " .. id .. " (" .. pretty(j.out) .. ") never finished", 1)
+        dispatch.jobs[id] = nil
+        saveJobs()
+      end
+    end
+    for i = #recent, 1, -1 do if now() - recent[i].t > 120 then table.remove(recent, i) end end
+    if not data.ok or data.paused then return end
+
+    local stock = {}
+    local okS, list = pcall(ticker.stock)
+    if okS and type(list) == "table" then
+      for _, it in pairs(list) do
+        if type(it) == "table" and it.name then stock[it.name] = (stock[it.name] or 0) + (it.count or 0) end
+      end
+    end
+    local wanted = {}
+    for _, g in ipairs(data.gauges) do
+      if not g.fluid and not g.paused and dispatch.recipes[g.item] then
+        local w = wanted[g.item] or { target = 0, stock = g.stock, passive = true }
+        w.target = math.max(w.target, g.targetItems)
+        if not g.passive then w.passive = false end
+        wanted[g.item] = w
+        lastStock[g.item] = g.stock
+      end
+    end
+    dispatch.state = {}
+    for out, w in pairs(wanted) do
+      local r = dispatch.recipes[out]
+      local deficit = w.target - w.stock - inFlight(out)
+      local why = deficit > 0 and "short" or "stocked"
+      if not w.passive then why = "gauge not Passive" deficit = 0 end
+      while deficit > 0 do
+        local station = freeStation()
+        if not station then why = "waiting for a free turtle" break end
+        local crafts = math.min(BATCH, math.ceil(deficit / (r.outCount or 1)))
+        local missing = {}
+        for name, per in pairs(perCraft(r.grid)) do
+          local can = math.floor((stock[name] or 0) / per)
+          if can < crafts then crafts = can end
+          if can <= 0 then table.insert(missing, pretty(name)) end
+        end
+        if crafts <= 0 then why = "missing " .. table.concat(missing, ", ") break end
+        if not order(out, crafts, station, stock) then why = "order failed" break end
+        deficit = deficit - crafts * (r.outCount or 1)
+        why = "crafting"
+      end
+      dispatch.state[out] = why
+    end
+    local flying = {}
+    for out in pairs(dispatch.recipes) do flying[out] = inFlight(out) end
+    dispatch.flying = flying
+  end
+
+  local function onMessage(from, msg)
+    if type(msg) ~= "table" then return end
+    if msg.kind == "station" then
+      local st = dispatch.stations[from] or {}
+      st.address, st.name, st.t, st.free, st.job = msg.address, msg.name or ("Turtle " .. from), now(), msg.free, msg.job
+      if st.assigned and (msg.job == st.assigned or now() - (st.assignedAt or 0) > 10) then st.assigned = nil end
+      if st.assigned then st.free = false end
+      dispatch.stations[from] = st
+    elseif msg.kind == "done" or msg.kind == "failed" then
+      local j = dispatch.jobs[msg.job]
+      if j then
+        local made = (msg.crafted or 0) * (j.outCount or 1)
+        if made > 0 then table.insert(recent, { out = j.out, count = made, t = now(), stockAt = lastStock[j.out] or 0 }) end
+        dispatch.jobs[msg.job] = nil
+        saveJobs()
+        if msg.kind == "failed" then note(pretty(j.out) .. ": " .. tostring(msg.reason) .. " (" .. made .. " made)", 2)
+        else note("Crafted " .. made .. "x " .. pretty(j.out), 5) end
+      end
+      if dispatch.stations[from] then dispatch.stations[from].assigned = nil end
+    elseif msg.kind == "learn" and type(msg.grid) == "table" and msg.out then
+      dispatch.recipes[msg.out] = { grid = msg.grid, outCount = msg.outCount or 1, by = from }
+      save(DIR .. "/recipes", dispatch.recipes)
+      note("Learned " .. pretty(msg.out) .. " (" .. (msg.outCount or 1) .. " per craft)", 5)
+      send({ kind = "learned", by = from, out = msg.out })
+    end
+  end
+
+  function dispatchLoop()
+    local nextTick = 0
+    while true do
+      if DISPATCH ~= false and not ticker then ticker = peripheral.find("Create_StockTicker") end
+      dispatch.active = DISPATCH ~= false and ticker ~= nil
+      local timer = os.startTimer(0.5)
+      local ev = { os.pullEvent() }
+      if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
+        pcall(onMessage, ev[2], ev[3])
+      elseif ev[1] == "peripheral_detach" then
+        ticker = nil
+      end
+      os.cancelTimer(timer)
+      if dispatch.active and now() >= nextTick then
+        nextTick = now() + 2
+        send({ kind = "dispatcher" })
+        local ok, err = pcall(tick)
+        if not ok then note("Dispatcher error: " .. tostring(err), 1) end
+      end
     end
   end
 end
@@ -715,6 +914,22 @@ local function drawTerminal()
     print("  " .. b.recipe .. " needs " .. pretty(b.item) .. " (" .. b.have .. "/" .. b.need .. "): " .. supplyState(b.item))
     term.setTextColor(colors.white)
   end
+  if dispatch.active then
+    local free, busy = 0, 0
+    for _, st in pairs(dispatch.stations) do
+      if now() - st.t < 8 then if st.free then free = free + 1 else busy = busy + 1 end end
+    end
+    local recipesN, jobsN = 0, 0
+    for _ in pairs(dispatch.recipes) do recipesN = recipesN + 1 end
+    for _ in pairs(dispatch.jobs) do jobsN = jobsN + 1 end
+    print("Turtles: " .. free .. " free, " .. busy .. " busy, " .. jobsN .. " orders, " .. recipesN .. " recipes")
+    for item, why in pairs(dispatch.state or {}) do
+      if why ~= "stocked" then print("  " .. pretty(item) .. ": " .. why) end
+    end
+    for i = 1, math.min(4, #dispatch.lines) do print("  " .. dispatch.lines[i]) end
+  elseif DISPATCH ~= false then
+    print("Turtles: off (no Stock Ticker on the network)")
+  end
   print("Display: " .. (useGpu and "DirectGPU" or "plain monitor"))
   if gpuError then
     term.setTextColor(colors.orange)
@@ -776,6 +991,7 @@ local function inputLoop()
 end
 
 local function readyToUpdate()
+  if next(dispatch.jobs) ~= nil then return false end  -- let running turtle orders finish
   return true
 end
 
@@ -932,4 +1148,4 @@ local function bootUpdate()
 end
 
 bootUpdate()
-parallel.waitForAny(dataLoop, netLoop, displayLoop, inputLoop, alertLoop, updateLoop)
+parallel.waitForAny(dataLoop, netLoop, displayLoop, inputLoop, alertLoop, dispatchLoop, updateLoop)
