@@ -373,7 +373,7 @@ do
       if not g.fluid and not g.paused and dispatch.recipes[g.item] then
         local w = wanted[g.item] or { target = 0, stock = g.stock, passive = true }
         w.target = math.max(w.target, g.targetItems)
-        if not g.passive then w.passive = false end
+        if not g.passive then w.passive, w.orderedBy = false, g.address end
         wanted[g.item] = w
         lastStock[g.item] = g.stock
       end
@@ -383,7 +383,10 @@ do
       local r = dispatch.recipes[out]
       local deficit = w.target - w.stock - inFlight(out)
       local why = deficit > 0 and "short" or "stocked"
-      if not w.passive then why = "gauge not Passive" deficit = 0 end
+      if not w.passive then
+        why = "a gauge for it orders by itself (sends to " .. tostring(w.orderedBy) .. "): set it to Passive"
+        deficit = 0
+      end
       while deficit > 0 do
         local station = freeStation()
         if not station then why = "waiting for a free turtle" break end
