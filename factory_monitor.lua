@@ -160,7 +160,8 @@ local function readController()
         stock = g.stock or 0, promised = g.promised or 0,
         satisfied = g.satisfied == true, waiting = g.waitingForNetwork == true,
         paused = g.redstonePowered == true, address = g.address or "",
-        passive = g.requestMode ~= "NORMAL",
+        -- safe to craft for: Passive, or no address (a gauge without one can't order anything itself)
+        passive = g.requestMode ~= "NORMAL" or (g.address or "") == "",
       }
       e.promised = e.promised + (dispatch.flying[g.item] or 0)
       e.targetItems = e.target * unitMult(e)
