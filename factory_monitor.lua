@@ -2,7 +2,7 @@
 -- Reads every gauge on the controller, draws a statistics dashboard on a
 -- monitor (full color with a DirectGPU block, plain text without), and shares
 -- the gauge data over rednet so the Mech Crafter computer knows what to make.
--- With a Stock Ticker on the network it also runs the crafty turtles (crafter.lua from
+-- With a Stock Ticker and a Redstone Requester on the network it also runs the crafty turtles (crafter.lua from
 -- cc-craft-dispatch): for every Passive gauge that is short and has a learned recipe it orders the
 -- ingredients for up to BATCH crafts to a free turtle's own address and tells it the recipe.
 
@@ -296,7 +296,7 @@ do
   local nextJob = load(DIR .. "/next", 1)
   local recent = {}                                -- finished results not yet in the gauge's stock
   local lastStock = {}
-  local ticker
+  local ticker, requester
 
   local function saveJobs() save(DIR .. "/jobs", dispatch.jobs) save(DIR .. "/next", nextJob) end
   local function note(text, sev)
@@ -328,15 +328,33 @@ do
     return best
   end
 
+  -- A Redstone Requester order: at most 9 entries of at most 256 items each.
+  local function entriesFor(grid, crafts)
+    local entries = {}
+    for name, per in pairs(perCraft(grid)) do
+      local left = per * crafts
+      while left > 0 do
+        local n = math.min(256, left)
+        table.insert(entries, { name = name, count = n })
+        left = left - n
+      end
+    end
+    return entries
+  end
+
   local function order(out, crafts, station, stock)
     local r, st = dispatch.recipes[out], dispatch.stations[station]
-    local filters = {}
-    for name, per in pairs(perCraft(r.grid)) do
-      table.insert(filters, { name = name, _requestCount = per * crafts })
-    end
-    local ok, sent = pcall(ticker.requestFiltered, st.address, table.unpack(filters))
-    if not ok or not sent or sent == 0 then
-      note("Couldn't order " .. pretty(out) .. " ingredients: " .. tostring(sent), 1)
+    while crafts > 1 and #entriesFor(r.grid, crafts) > 9 do crafts = crafts - 1 end
+    -- the Stock Ticker's own ordering crashes on dedicated servers (it reads every item's
+    -- details), so orders go through a Redstone Requester; the Stock Ticker only reads stock
+    local ok, err = pcall(function()
+      requester.setConfiguration("strict")
+      requester.setAddress(st.address)
+      requester.setRequest(table.unpack(entriesFor(r.grid, crafts)))
+      requester.request()
+    end)
+    if not ok then
+      note("Couldn't order " .. pretty(out) .. " ingredients: " .. tostring(err), 1)
       return false
     end
     for name, per in pairs(perCraft(r.grid)) do stock[name] = (stock[name] or 0) - per * crafts end
@@ -440,13 +458,15 @@ do
     local nextTick = 0
     while true do
       if DISPATCH ~= false and not ticker then ticker = peripheral.find("Create_StockTicker") end
-      dispatch.active = DISPATCH ~= false and ticker ~= nil
+      if DISPATCH ~= false and not requester then requester = peripheral.find("Create_RedstoneRequester") end
+      dispatch.active = DISPATCH ~= false and ticker ~= nil and requester ~= nil
+      dispatch.missingPart = not ticker and "Stock Ticker" or not requester and "Redstone Requester" or nil
       local timer = os.startTimer(0.5)
       local ev = { os.pullEvent() }
       if ev[1] == "rednet_message" and ev[4] == PROTOCOL then
         pcall(onMessage, ev[2], ev[3])
       elseif ev[1] == "peripheral_detach" then
-        ticker = nil
+        ticker, requester = nil, nil
       end
       os.cancelTimer(timer)
       if dispatch.active and now() >= nextTick then
@@ -932,7 +952,7 @@ local function drawTerminal()
     end
     for i = 1, math.min(4, #dispatch.lines) do print("  " .. dispatch.lines[i]) end
   elseif DISPATCH ~= false then
-    print("Turtles: off (no Stock Ticker on the network)")
+    print("Turtles: off (no " .. tostring(dispatch.missingPart or "Stock Ticker") .. " on the network)")
   end
   print("Display: " .. (useGpu and "DirectGPU" or "plain monitor"))
   if gpuError then
