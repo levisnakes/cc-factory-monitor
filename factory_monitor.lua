@@ -38,7 +38,7 @@ end
 
 -- ============================================================ basics
 
-local VERSION = "1.1.0"
+local VERSION = "1.1.1"
 local function now() return os.epoch("utc") / 1000 end
 
 -- turtle crafting (filled in by the dispatcher block further down)
@@ -345,9 +345,20 @@ do
     return entries
   end
 
+
+  -- An order must fit in the turtle's barrel (27 slots, a few kept free): fewer crafts for
+  -- ingredients that stack to less than 64.
+  local function barrelSlots(r, crafts)
+    local slots = 0
+    for name, per in pairs(perCraft(r.grid)) do
+      slots = slots + math.ceil(per * crafts / ((r.stacks or {})[name] or 64))
+    end
+    return slots
+  end
+
   local function order(out, crafts, station, stock)
     local r, st = dispatch.recipes[out], dispatch.stations[station]
-    while crafts > 1 and #entriesFor(r.grid, crafts) > 9 do crafts = crafts - 1 end
+    while crafts > 1 and (#entriesFor(r.grid, crafts) > 9 or barrelSlots(r, crafts) > 24) do crafts = crafts - 1 end
     -- the Stock Ticker's own ordering crashes on dedicated servers (it reads every item's
     -- details), so orders go through a Redstone Requester; the Stock Ticker only reads stock
     local ok, err = pcall(function()
@@ -368,7 +379,7 @@ do
     dispatch.jobs[id] = { id = id, station = station, out = out, crafts = crafts, outCount = r.outCount or 1, t = now(), need = need }
     saveJobs()
     st.assigned, st.assignedAt = id, now()
-    send({ kind = "job", to = station, job = id, grid = r.grid, crafts = crafts, out = out, outCount = r.outCount or 1 })
+    send({ kind = "job", to = station, job = id, grid = r.grid, crafts = crafts, out = out, outCount = r.outCount or 1, outStack = r.outStack })
     note("Ordered " .. crafts * (r.outCount or 1) .. "x " .. pretty(out) .. " -> " .. st.name, 3)
     return true
   end
@@ -463,7 +474,7 @@ do
       end
       if dispatch.stations[from] then dispatch.stations[from].assigned = nil end
     elseif msg.kind == "learn" and type(msg.grid) == "table" and msg.out then
-      dispatch.recipes[msg.out] = { grid = msg.grid, outCount = msg.outCount or 1, by = from }
+      dispatch.recipes[msg.out] = { grid = msg.grid, outCount = msg.outCount or 1, outStack = msg.outStack, stacks = msg.stacks, by = from }
       save(DIR .. "/recipes", dispatch.recipes)
       note("Learned " .. pretty(msg.out) .. " (" .. (msg.outCount or 1) .. " per craft)", 5)
       send({ kind = "learned", by = from, out = msg.out })
