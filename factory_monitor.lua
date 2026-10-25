@@ -38,6 +38,7 @@ end
 
 -- ============================================================ basics
 
+local VERSION = "1.1.0"
 local function now() return os.epoch("utc") / 1000 end
 
 -- turtle crafting (filled in by the dispatcher block further down)
@@ -935,7 +936,7 @@ local function drawTerminal()
   term.clear()
   term.setCursorPos(1, 1)
   term.setTextColor(colors.white)
-  print("Factory Monitor")
+  print("Factory Monitor v" .. VERSION)
   print("")
   if data.ok then
     local s = stats()
