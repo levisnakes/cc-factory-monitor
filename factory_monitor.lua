@@ -295,6 +295,8 @@ do
   dispatch.jobs = load(DIR .. "/jobs", {})         -- [id] = { id, station, out, crafts, outCount, t }
   local nextJob = load(DIR .. "/next", 1)
   local recent = {}                                -- finished results not yet in the gauge's stock
+  local cooldown = {}                              -- [output] = time; after an order where nothing arrived
+  local RESERVE_SECONDS = 90                       -- ingredients ordered this recently may still show in stock
   local lastStock = {}
   local ticker, requester
 
@@ -360,7 +362,9 @@ do
     for name, per in pairs(perCraft(r.grid)) do stock[name] = (stock[name] or 0) - per * crafts end
     local id = nextJob
     nextJob = nextJob + 1
-    dispatch.jobs[id] = { id = id, station = station, out = out, crafts = crafts, outCount = r.outCount or 1, t = now() }
+    local need = {}
+    for name, per in pairs(perCraft(r.grid)) do need[name] = per * crafts end
+    dispatch.jobs[id] = { id = id, station = station, out = out, crafts = crafts, outCount = r.outCount or 1, t = now(), need = need }
     saveJobs()
     st.assigned, st.assignedAt = id, now()
     send({ kind = "job", to = station, job = id, grid = r.grid, crafts = crafts, out = out, outCount = r.outCount or 1 })
@@ -386,6 +390,12 @@ do
         if type(it) == "table" and it.name then stock[it.name] = (stock[it.name] or 0) + (it.count or 0) end
       end
     end
+    -- ingredients ordered moments ago can still be sitting in storage: don't promise them twice
+    for _, j in pairs(dispatch.jobs) do
+      if now() - j.t < RESERVE_SECONDS then
+        for name, n in pairs(j.need or {}) do stock[name] = (stock[name] or 0) - n end
+      end
+    end
     local wanted = {}
     for _, g in ipairs(data.gauges) do
       if not g.fluid and not g.paused and dispatch.recipes[g.item] then
@@ -401,6 +411,10 @@ do
       local r = dispatch.recipes[out]
       local deficit = w.target - w.stock - inFlight(out)
       local why = deficit > 0 and "short" or "stocked"
+      if deficit > 0 and cooldown[out] and now() < cooldown[out] then
+        why = "nothing arrived, retry in " .. math.ceil(cooldown[out] - now()) .. "s"
+        deficit = 0
+      end
       if not w.passive then
         why = "a gauge for it orders by itself (sends to " .. tostring(w.orderedBy) .. "): set it to Passive"
         deficit = 0
@@ -442,6 +456,7 @@ do
         if made > 0 then table.insert(recent, { out = j.out, count = made, t = now(), stockAt = lastStock[j.out] or 0 }) end
         dispatch.jobs[msg.job] = nil
         saveJobs()
+        if msg.kind == "failed" and made == 0 then cooldown[j.out] = now() + 120 end
         if msg.kind == "failed" then note(pretty(j.out) .. ": " .. tostring(msg.reason) .. " (" .. made .. " made)", 2)
         else note("Crafted " .. made .. "x " .. pretty(j.out), 5) end
       end
